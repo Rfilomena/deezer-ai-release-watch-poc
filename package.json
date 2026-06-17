@@ -1,8 +1,8 @@
 {
-  "name": "deezer-ai-release-poc",
+  "name": "spotify-playlist-ai-label-poc",
   "version": "0.1.0",
   "private": true,
-  "description": "Small proof-of-concept for cross-referencing competitor Spotify releases against Deezer metadata for AI-label exposure.",
+  "description": "Small proof-of-concept for cross-referencing Spotify playlist tracks against Deezer metadata for AI-label exposure.",
   "scripts": {
     "start": "node server.js"
   },
