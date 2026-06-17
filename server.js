@@ -1,3 +1,4 @@
+const crypto = require("node:crypto");
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -9,10 +10,14 @@ const PORT = Number(process.env.PORT || 5057);
 const HOST = process.env.HOST || "0.0.0.0";
 const PUBLIC_DIR = path.join(__dirname, "public");
 const SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token";
+const SPOTIFY_AUTHORIZE_URL = "https://accounts.spotify.com/authorize";
 const SPOTIFY_API = "https://api.spotify.com/v1";
 const DEEZER_API = "https://api.deezer.com";
+const SPOTIFY_SCOPES = "playlist-read-private playlist-read-collaborative";
 
-let spotifyToken = null;
+let spotifyAppToken = null;
+let spotifyUserToken = null;
+let pendingSpotifyState = "";
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -21,13 +26,28 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/api/health") {
       return sendJson(res, 200, {
         ok: true,
-        spotifyConfigured: Boolean(process.env.SPOTIFY_CLIENT_ID && process.env.SPOTIFY_CLIENT_SECRET),
+        spotifyConfigured: hasSpotifyCredentials(),
+        spotifySignedIn: Boolean(spotifyUserToken),
+        spotifyRedirectUri: spotifyRedirectUri(req),
       });
     }
 
-    if (req.method === "POST" && url.pathname === "/api/scan") {
+    if (req.method === "GET" && url.pathname === "/auth/spotify") {
+      return redirectToSpotify(req, res);
+    }
+
+    if (req.method === "GET" && url.pathname === "/auth/spotify/callback") {
+      return handleSpotifyCallback(req, res, url);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/logout") {
+      spotifyUserToken = null;
+      return sendJson(res, 200, { ok: true });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/scan-playlist") {
       const body = await readJson(req);
-      const result = await scan(body);
+      const result = await scanPlaylist(body);
       return sendJson(res, 200, result);
     }
 
@@ -45,282 +65,162 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`Deezer AI Release Watch POC running at http://localhost:${PORT}`);
+  console.log(`Spotify playlist AI label checker running at http://localhost:${PORT}`);
 });
 
-function loadEnvFile() {
-  const envPath = path.join(__dirname, ".env");
-  if (!fs.existsSync(envPath)) return;
+async function scanPlaylist(body) {
+  const playlistInput = String(body.playlist || "").trim();
+  const market = String(body.market || "US").trim().toUpperCase();
+  const maxTracks = clamp(Number(body.maxTracks || 200), 1, 500);
+  const playlistId = extractSpotifyId(playlistInput, "playlist");
 
-  const lines = fs.readFileSync(envPath, "utf8").split(/\r?\n/);
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eq = trimmed.indexOf("=");
-    if (eq === -1) continue;
-    const key = trimmed.slice(0, eq).trim();
-    const value = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
-    if (!process.env[key]) process.env[key] = value;
-  }
-}
-
-async function scan(body) {
-  const mode = body.mode || "manual";
-  const market = (body.market || "US").trim().toUpperCase();
-  const maxAlbums = clamp(Number(body.maxAlbums || 10), 1, 50);
-  const rows = parseInputRows(body.input || "");
-
-  if (!rows.length) {
-    return { rows: [], summary: { scanned: 0, aiFound: 0, matched: 0 } };
+  if (!playlistId) {
+    throw new Error("Paste a valid Spotify playlist URI, URL, or ID.");
   }
 
-  let releases = [];
+  const playlist = await getSpotifyPlaylist(playlistId, market);
+  const spotifyTracks = (await getSpotifyPlaylistTracks(playlistId, market, maxTracks))
+    .filter((track) => track && !track.isLocal)
+    .slice(0, maxTracks);
 
-  if (mode === "manual") {
-    releases = rows.map(parseManualRelease).filter(Boolean);
-  } else if (mode === "spotify-albums") {
-    releases = await spotifyAlbumsFromRows(rows, market);
-  } else if (mode === "spotify-artists") {
-    releases = await spotifyArtistReleasesFromRows(rows, market, maxAlbums);
-  } else {
-    throw new Error(`Unknown scan mode: ${mode}`);
+  const rows = [];
+  for (const track of spotifyTracks) {
+    rows.push(await enrichTrackWithDeezer(track));
   }
 
-  const limited = releases.slice(0, mode === "spotify-artists" ? maxAlbums * rows.length : 100);
-  const results = [];
-
-  for (const release of limited) {
-    results.push(await enrichWithDeezer(release));
-  }
+  const matched = rows.filter((row) => row.deezer.matched).length;
+  const aiFound = rows.filter((row) => row.ai.status === "ai").length;
+  const noAiLabel = rows.filter((row) => row.ai.status === "no_public_label").length;
+  const noMatch = rows.filter((row) => row.ai.status === "unknown").length;
 
   return {
-    rows: results,
+    playlist,
+    rows,
     summary: {
-      scanned: results.length,
-      matched: results.filter((row) => row.deezer?.matched).length,
-      aiFound: results.filter((row) => row.ai.status === "found").length,
-      noMatch: results.filter((row) => !row.deezer?.matched).length,
+      scanned: rows.length,
+      matched,
+      aiFound,
+      noAiLabel,
+      noMatch,
     },
   };
 }
 
-function parseInputRows(input) {
-  return input
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line && !line.startsWith("#"));
-}
-
-function parseManualRelease(line) {
-  const parts = line.split(/[|\t,]/).map((part) => part.trim()).filter(Boolean);
-  if (parts.length < 2) return null;
+async function getSpotifyPlaylist(playlistId, market) {
+  const data = await spotifyGet(
+    `/playlists/${playlistId}?market=${encodeURIComponent(market)}&fields=id,name,external_urls,owner(display_name),tracks(total)`,
+    { preferUserToken: true },
+  );
 
   return {
-    source: "manual",
-    artistName: parts[0],
-    albumName: parts[1],
-    upc: parts[2] || "",
-    releaseDate: "",
-    spotifyAlbumId: "",
-    spotifyUrl: "",
-    spotifyLabel: "",
-    tracks: [],
+    id: data.id,
+    name: data.name || "Spotify playlist",
+    owner: data.owner?.display_name || "",
+    totalTracks: data.tracks?.total || 0,
+    spotifyUrl: data.external_urls?.spotify || `https://open.spotify.com/playlist/${playlistId}`,
   };
 }
 
-async function spotifyAlbumsFromRows(rows, market) {
-  const releases = [];
-  for (const row of rows) {
-    const albumId = extractSpotifyId(row, "album");
-    if (!albumId) {
-      releases.push(errorRelease(row, "Could not parse Spotify album ID"));
-      continue;
-    }
-    releases.push(await getSpotifyAlbumRelease(albumId, market));
-  }
-  return releases;
-}
-
-async function spotifyArtistReleasesFromRows(rows, market, maxAlbums) {
-  const releases = [];
-  for (const row of rows) {
-    const artistId = extractSpotifyId(row, "artist");
-    if (!artistId) {
-      releases.push(errorRelease(row, "Could not parse Spotify artist ID"));
-      continue;
-    }
-
-    const albums = await spotifyGet(`/artists/${artistId}/albums?include_groups=album,single&market=${encodeURIComponent(market)}&limit=10`);
-    const sorted = dedupeAlbums(albums.items || [])
-      .sort((a, b) => normalizedDate(b.release_date).localeCompare(normalizedDate(a.release_date)))
-      .slice(0, maxAlbums);
-
-    for (const album of sorted) {
-      releases.push(await getSpotifyAlbumRelease(album.id, market));
-    }
-  }
-  return releases;
-}
-
-async function getSpotifyAlbumRelease(albumId, market) {
-  const album = await spotifyGet(`/albums/${albumId}?market=${encodeURIComponent(market)}`);
-  const simplifiedTracks = album.tracks?.items || [];
-  const trackIds = simplifiedTracks.map((track) => track.id).filter(Boolean);
-  const detailedTracks = await getSpotifyTracks(trackIds, market);
-
-  return {
-    source: "spotify",
-    artistName: (album.artists || []).map((artist) => artist.name).join(", "),
-    albumName: album.name || "",
-    upc: album.external_ids?.upc || album.external_ids?.ean || "",
-    releaseDate: album.release_date || "",
-    spotifyAlbumId: album.id,
-    spotifyUrl: album.external_urls?.spotify || "",
-    spotifyLabel: album.label || "",
-    albumType: album.album_type || "",
-    tracks: detailedTracks.map((track) => ({
-      id: track.id,
-      name: track.name,
-      artistName: (track.artists || []).map((artist) => artist.name).join(", "),
-      isrc: track.external_ids?.isrc || "",
-      spotifyUrl: track.external_urls?.spotify || "",
-    })),
-  };
-}
-
-async function getSpotifyTracks(ids, market) {
-  const chunks = [];
-  for (let i = 0; i < ids.length; i += 50) chunks.push(ids.slice(i, i + 50));
+async function getSpotifyPlaylistTracks(playlistId, market, maxTracks) {
   const tracks = [];
+  let offset = 0;
 
-  for (const chunk of chunks) {
-    if (!chunk.length) continue;
-    const data = await spotifyGet(`/tracks?ids=${encodeURIComponent(chunk.join(","))}&market=${encodeURIComponent(market)}`);
-    tracks.push(...(data.tracks || []).filter(Boolean));
+  while (tracks.length < maxTracks) {
+    const fields = [
+      "total",
+      "next",
+      "items(track(id,type,is_local,name,external_ids,external_urls,artists(id,name),album(id,name,release_date,external_urls)))",
+    ].join(",");
+    const endpoint = `/playlists/${playlistId}/tracks?market=${encodeURIComponent(market)}&limit=100&offset=${offset}&fields=${encodeURIComponent(fields)}`;
+    const data = await spotifyGet(endpoint, { preferUserToken: true });
+    const items = data.items || [];
+
+    for (const item of items) {
+      const track = item.track;
+      if (!track || track.type !== "track") continue;
+      tracks.push({
+        rowNumber: tracks.length + 1,
+        spotifyTrackId: track.id || "",
+        name: track.name || "",
+        artistName: (track.artists || []).map((artist) => artist.name).join(", "),
+        albumName: track.album?.name || "",
+        albumDate: track.album?.release_date || "",
+        isrc: track.external_ids?.isrc || "",
+        spotifyUrl: track.external_urls?.spotify || "",
+        albumUrl: track.album?.external_urls?.spotify || "",
+        isLocal: Boolean(track.is_local),
+      });
+    }
+
+    if (!data.next || !items.length) break;
+    offset += items.length;
   }
 
   return tracks;
 }
 
-async function spotifyGet(endpoint) {
-  const token = await getSpotifyToken();
-  const response = await fetchWithTimeout(`${SPOTIFY_API}${endpoint}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+async function enrichTrackWithDeezer(spotifyTrack) {
+  const match = await findDeezerTrack(spotifyTrack);
 
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Spotify API ${response.status}: ${text.slice(0, 240)}`);
-  }
-
-  return response.json();
-}
-
-async function getSpotifyToken() {
-  if (spotifyToken && spotifyToken.expiresAt > Date.now() + 60_000) {
-    return spotifyToken.accessToken;
-  }
-
-  const clientId = process.env.SPOTIFY_CLIENT_ID;
-  const clientSecret = process.env.SPOTIFY_CLIENT_SECRET;
-  if (!clientId || !clientSecret) {
-    throw new Error("Spotify credentials are not configured. Add SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET to .env.");
-  }
-
-  const credentials = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
-  const response = await fetchWithTimeout(SPOTIFY_TOKEN_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Basic ${credentials}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: "grant_type=client_credentials",
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Spotify token request failed ${response.status}: ${text.slice(0, 240)}`);
-  }
-
-  const data = await response.json();
-  spotifyToken = {
-    accessToken: data.access_token,
-    expiresAt: Date.now() + Number(data.expires_in || 3600) * 1000,
-  };
-  return spotifyToken.accessToken;
-}
-
-async function enrichWithDeezer(release) {
-  if (release.error) {
+  if (!match.track) {
     return {
-      release,
-      deezer: { matched: false, method: "", error: release.error },
-      ai: { status: "unknown", label: "Input error", evidence: [] },
+      spotify: spotifyTrack,
+      deezer: {
+        matched: false,
+        method: match.method || "",
+        error: match.error || "No Deezer match",
+      },
+      ai: {
+        status: "unknown",
+        label: "Unknown",
+        evidence: [],
+      },
     };
   }
 
-  const match = await findDeezerAlbum(release);
-
-  if (!match.album) {
-    return {
-      release,
-      deezer: { matched: false, method: match.method || "", error: match.error || "" },
-      ai: { status: "unknown", label: "No Deezer match", evidence: [] },
-    };
-  }
-
-  const inspected = await buildDeezerInspectionPayload(match.album);
+  const inspected = await buildDeezerTrackInspectionPayload(match.track);
   const evidence = findAiEvidence(inspected);
-  const status = evidence.length ? "found" : "not_exposed";
+  const hasAiEvidence = evidence.length > 0;
 
   return {
-    release,
+    spotify: spotifyTrack,
     deezer: {
       matched: true,
       method: match.method,
-      albumId: match.album.id,
-      albumTitle: match.album.title,
-      artistName: match.album.artist?.name || (match.album.contributors || []).map((artist) => artist.name).filter(Boolean).join(", "),
-      label: match.album.label || "",
-      link: match.album.link || "",
-      releaseDate: match.album.release_date || "",
-      trackCount: match.album.nb_tracks || match.album.tracks?.data?.length || "",
+      trackId: match.track.id,
+      title: match.track.title || match.track.title_short || "",
+      artistName: match.track.artist?.name || "",
+      albumTitle: match.track.album?.title || "",
+      albumId: match.track.album?.id || "",
+      link: match.track.link || "",
     },
     ai: {
-      status,
-      label: status === "found" ? "AI indicator found" : "No AI indicator exposed",
+      status: hasAiEvidence ? "ai" : "no_public_label",
+      label: hasAiEvidence ? "AI" : "No AI label found",
       evidence,
     },
   };
 }
 
-async function findDeezerAlbum(release) {
+async function findDeezerTrack(spotifyTrack) {
   const attempts = [];
 
-  if (release.upc) {
+  if (spotifyTrack.isrc) {
     attempts.push({
-      method: "upc",
-      url: `${DEEZER_API}/album/upc:${encodeURIComponent(release.upc)}`,
+      method: "isrc",
+      url: `${DEEZER_API}/track/isrc:${encodeURIComponent(spotifyTrack.isrc)}`,
     });
   }
 
-  for (const track of (release.tracks || []).filter((track) => track.isrc).slice(0, 5)) {
-    attempts.push({
-      method: `track-isrc:${track.isrc}`,
-      url: `${DEEZER_API}/track/isrc:${encodeURIComponent(track.isrc)}`,
-      fromTrack: true,
-    });
-  }
-
-  const strictQuery = `artist:"${release.artistName}" album:"${release.albumName}"`;
+  const strictQuery = `track:"${spotifyTrack.name}" artist:"${spotifyTrack.artistName}"`;
   attempts.push({
-    method: "album-search-strict",
-    url: `${DEEZER_API}/search/album?q=${encodeURIComponent(strictQuery)}&limit=3`,
+    method: "track-search-strict",
+    url: `${DEEZER_API}/search/track?q=${encodeURIComponent(strictQuery)}&limit=5`,
     search: true,
   });
   attempts.push({
-    method: "album-search-loose",
-    url: `${DEEZER_API}/search/album?q=${encodeURIComponent(`${release.artistName} ${release.albumName}`)}&limit=3`,
+    method: "track-search-loose",
+    url: `${DEEZER_API}/search/track?q=${encodeURIComponent(`${spotifyTrack.name} ${spotifyTrack.artistName}`)}&limit=5`,
     search: true,
   });
 
@@ -335,45 +235,39 @@ async function findDeezerAlbum(release) {
         continue;
       }
 
-      if (attempt.fromTrack && data.album?.id) {
-        const album = await deezerGet(`${DEEZER_API}/album/${data.album.id}`);
-        if (!album?.error) return { album, method: attempt.method };
-      } else if (attempt.search) {
-        const best = pickBestAlbumSearchResult(data.data || [], release);
+      if (attempt.search) {
+        const best = pickBestTrackSearchResult(data.data || [], spotifyTrack);
         if (best?.id) {
-          const album = await deezerGet(`${DEEZER_API}/album/${best.id}`);
-          if (!album?.error) return { album, method: attempt.method };
+          const fullTrack = await deezerGet(`${DEEZER_API}/track/${best.id}`);
+          if (!fullTrack?.error) return { track: fullTrack, method: attempt.method };
         }
       } else if (data?.id) {
-        return { album: data, method: attempt.method };
+        const fullTrack = await deezerGet(`${DEEZER_API}/track/${data.id}`);
+        return { track: fullTrack?.error ? data : fullTrack, method: attempt.method };
       }
     } catch (error) {
       errors.push(`${attempt.method}: ${error.message}`);
     }
   }
 
-  return { album: null, method: "", error: errors.join(" | ") };
+  return { track: null, method: "", error: errors.join(" | ") };
 }
 
-async function buildDeezerInspectionPayload(album) {
-  const payload = { album };
-  const tracks = album.tracks?.data || [];
-  payload.tracks = [];
+async function buildDeezerTrackInspectionPayload(track) {
+  const payload = { track };
 
-  for (const track of tracks.slice(0, 25)) {
-    if (!track.id) continue;
+  if (track.album?.id) {
     try {
-      const fullTrack = await deezerGet(`${DEEZER_API}/track/${track.id}`);
-      payload.tracks.push(fullTrack?.error ? track : fullTrack);
+      const album = await deezerGet(`${DEEZER_API}/album/${track.album.id}`);
+      if (!album?.error) payload.album = album;
     } catch {
-      payload.tracks.push(track);
+      // Album details are optional for this proof.
     }
   }
 
-  const artistId = album.artist?.id || album.contributors?.[0]?.id;
-  if (artistId) {
+  if (track.artist?.id) {
     try {
-      const artist = await deezerGet(`${DEEZER_API}/artist/${artistId}`);
+      const artist = await deezerGet(`${DEEZER_API}/artist/${track.artist.id}`);
       if (!artist?.error) payload.artist = artist;
     } catch {
       // Artist details are optional for this proof.
@@ -381,6 +275,179 @@ async function buildDeezerInspectionPayload(album) {
   }
 
   return payload;
+}
+
+async function spotifyGet(endpoint, options = {}) {
+  const token = await getSpotifyToken(options);
+  const response = await fetchWithTimeout(`${SPOTIFY_API}${endpoint}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  if (response.status === 401 && spotifyUserToken) {
+    spotifyUserToken = null;
+  }
+
+  if (!response.ok) {
+    const text = await response.text();
+    if (response.status === 403) {
+      throw new Error("Spotify denied playlist access. Sign in with a Spotify account that owns or collaborates on this playlist, or try a different playlist.");
+    }
+    throw new Error(`Spotify API ${response.status}: ${text.slice(0, 240)}`);
+  }
+
+  return response.json();
+}
+
+async function getSpotifyToken(options = {}) {
+  if (options.preferUserToken && spotifyUserToken) {
+    return getSpotifyUserAccessToken();
+  }
+  return getSpotifyAppAccessToken();
+}
+
+async function getSpotifyUserAccessToken() {
+  if (!spotifyUserToken) {
+    throw new Error("Spotify sign-in is required for this playlist.");
+  }
+
+  if (spotifyUserToken.expiresAt > Date.now() + 60_000) {
+    return spotifyUserToken.accessToken;
+  }
+
+  if (!spotifyUserToken.refreshToken) {
+    spotifyUserToken = null;
+    throw new Error("Spotify sign-in expired. Sign in again.");
+  }
+
+  const response = await fetchWithTimeout(SPOTIFY_TOKEN_URL, {
+    method: "POST",
+    headers: spotifyTokenHeaders(),
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: spotifyUserToken.refreshToken,
+    }),
+  });
+
+  if (!response.ok) {
+    spotifyUserToken = null;
+    const text = await response.text();
+    throw new Error(`Spotify token refresh failed ${response.status}: ${text.slice(0, 240)}`);
+  }
+
+  const data = await response.json();
+  spotifyUserToken = {
+    accessToken: data.access_token,
+    refreshToken: data.refresh_token || spotifyUserToken.refreshToken,
+    expiresAt: Date.now() + Number(data.expires_in || 3600) * 1000,
+  };
+  return spotifyUserToken.accessToken;
+}
+
+async function getSpotifyAppAccessToken() {
+  if (spotifyAppToken && spotifyAppToken.expiresAt > Date.now() + 60_000) {
+    return spotifyAppToken.accessToken;
+  }
+
+  if (!hasSpotifyCredentials()) {
+    throw new Error("Spotify credentials are not configured. Add SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET to .env or Replit Secrets.");
+  }
+
+  const response = await fetchWithTimeout(SPOTIFY_TOKEN_URL, {
+    method: "POST",
+    headers: spotifyTokenHeaders(),
+    body: "grant_type=client_credentials",
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Spotify token request failed ${response.status}: ${text.slice(0, 240)}`);
+  }
+
+  const data = await response.json();
+  spotifyAppToken = {
+    accessToken: data.access_token,
+    expiresAt: Date.now() + Number(data.expires_in || 3600) * 1000,
+  };
+  return spotifyAppToken.accessToken;
+}
+
+function redirectToSpotify(req, res) {
+  if (!hasSpotifyCredentials()) {
+    return sendJson(res, 500, { error: "Spotify credentials are not configured." });
+  }
+
+  pendingSpotifyState = crypto.randomBytes(16).toString("hex");
+  const url = new URL(SPOTIFY_AUTHORIZE_URL);
+  url.searchParams.set("client_id", process.env.SPOTIFY_CLIENT_ID);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("redirect_uri", spotifyRedirectUri(req));
+  url.searchParams.set("scope", SPOTIFY_SCOPES);
+  url.searchParams.set("state", pendingSpotifyState);
+  res.writeHead(302, { Location: url.toString() });
+  res.end();
+}
+
+async function handleSpotifyCallback(req, res, url) {
+  const code = url.searchParams.get("code");
+  const state = url.searchParams.get("state");
+  const error = url.searchParams.get("error");
+
+  if (error) {
+    res.writeHead(302, { Location: `/?spotify_error=${encodeURIComponent(error)}` });
+    return res.end();
+  }
+
+  if (!code || !pendingSpotifyState || state !== pendingSpotifyState) {
+    res.writeHead(302, { Location: "/?spotify_error=invalid_state" });
+    return res.end();
+  }
+
+  pendingSpotifyState = "";
+  const response = await fetchWithTimeout(SPOTIFY_TOKEN_URL, {
+    method: "POST",
+    headers: spotifyTokenHeaders(),
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: spotifyRedirectUri(req),
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    res.writeHead(302, { Location: `/?spotify_error=${encodeURIComponent(text.slice(0, 120))}` });
+    return res.end();
+  }
+
+  const data = await response.json();
+  spotifyUserToken = {
+    accessToken: data.access_token,
+    refreshToken: data.refresh_token,
+    expiresAt: Date.now() + Number(data.expires_in || 3600) * 1000,
+  };
+
+  res.writeHead(302, { Location: "/" });
+  res.end();
+}
+
+function spotifyRedirectUri(req) {
+  if (process.env.SPOTIFY_REDIRECT_URI) return process.env.SPOTIFY_REDIRECT_URI;
+
+  const proto = req.headers["x-forwarded-proto"] || "http";
+  const host = req.headers["x-forwarded-host"] || req.headers.host;
+  return `${proto}://${host}/auth/spotify/callback`;
+}
+
+function spotifyTokenHeaders() {
+  const credentials = Buffer.from(`${process.env.SPOTIFY_CLIENT_ID}:${process.env.SPOTIFY_CLIENT_SECRET}`).toString("base64");
+  return {
+    Authorization: `Basic ${credentials}`,
+    "Content-Type": "application/x-www-form-urlencoded",
+  };
+}
+
+function hasSpotifyCredentials() {
+  return Boolean(process.env.SPOTIFY_CLIENT_ID && process.env.SPOTIFY_CLIENT_SECRET);
 }
 
 async function deezerGet(url) {
@@ -440,17 +507,19 @@ function inspectField(key, value, pathParts, evidence) {
   }
 }
 
-function pickBestAlbumSearchResult(items, release) {
+function pickBestTrackSearchResult(items, spotifyTrack) {
   if (!items.length) return null;
 
-  const targetAlbum = normalizeText(release.albumName);
-  const targetArtist = normalizeText(release.artistName);
+  const targetTrack = normalizeText(spotifyTrack.name);
+  const targetArtist = normalizeText(spotifyTrack.artistName);
+  const targetAlbum = normalizeText(spotifyTrack.albumName);
 
   return items
     .map((item) => {
-      const albumScore = similarity(targetAlbum, normalizeText(item.title || ""));
+      const trackScore = similarity(targetTrack, normalizeText(item.title || item.title_short || ""));
       const artistScore = similarity(targetArtist, normalizeText(item.artist?.name || ""));
-      return { item, score: albumScore * 0.7 + artistScore * 0.3 };
+      const albumScore = similarity(targetAlbum, normalizeText(item.album?.title || ""));
+      return { item, score: trackScore * 0.6 + artistScore * 0.3 + albumScore * 0.1 };
     })
     .sort((a, b) => b.score - a.score)[0]?.item || items[0];
 }
@@ -471,25 +540,6 @@ function extractSpotifyId(input, expectedType) {
   } catch {
     return "";
   }
-}
-
-function dedupeAlbums(albums) {
-  const seen = new Set();
-  const result = [];
-  for (const album of albums) {
-    const key = `${normalizeText(album.name)}|${album.release_date || ""}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    result.push(album);
-  }
-  return result;
-}
-
-function normalizedDate(date) {
-  if (!date) return "0000-00-00";
-  if (/^\d{4}$/.test(date)) return `${date}-00-00`;
-  if (/^\d{4}-\d{2}$/.test(date)) return `${date}-00`;
-  return date;
 }
 
 function normalizeText(text) {
@@ -514,21 +564,6 @@ function similarity(a, b) {
   return intersection / union;
 }
 
-function errorRelease(input, error) {
-  return {
-    source: "input",
-    artistName: "",
-    albumName: input,
-    upc: "",
-    releaseDate: "",
-    spotifyAlbumId: "",
-    spotifyUrl: "",
-    spotifyLabel: "",
-    tracks: [],
-    error,
-  };
-}
-
 async function fetchWithTimeout(url, options = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), options.timeoutMs || 15_000);
@@ -542,6 +577,22 @@ async function fetchWithTimeout(url, options = {}) {
 function clamp(value, min, max) {
   if (!Number.isFinite(value)) return min;
   return Math.max(min, Math.min(max, value));
+}
+
+function loadEnvFile() {
+  const envPath = path.join(__dirname, ".env");
+  if (!fs.existsSync(envPath)) return;
+
+  const lines = fs.readFileSync(envPath, "utf8").split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    const value = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
+    if (!process.env[key]) process.env[key] = value;
+  }
 }
 
 async function readJson(req) {
