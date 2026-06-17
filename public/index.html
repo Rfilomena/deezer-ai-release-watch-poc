@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>AI Release Watch POC</title>
+    <title>Spotify Playlist AI Label Check</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
@@ -12,19 +12,18 @@
         <div class="topline">
           <div>
             <p class="eyebrow">Mood Works POC</p>
-            <h1>AI Release Watch</h1>
+            <h1>Spotify Playlist AI Label Check</h1>
           </div>
-          <div class="status" id="status">Checking setup...</div>
+          <div class="status-stack">
+            <div class="status" id="status">Checking setup...</div>
+            <a class="auth-link" id="spotifyAuth" href="/auth/spotify">Sign in with Spotify</a>
+          </div>
         </div>
 
-        <div class="controls">
-          <label>
-            Scan source
-            <select id="mode">
-              <option value="manual">Manual Deezer probe</option>
-              <option value="spotify-albums">Spotify album links</option>
-              <option value="spotify-artists">Spotify artist links</option>
-            </select>
+        <div class="controls playlist-controls">
+          <label class="wide">
+            Spotify playlist URI or link
+            <input id="playlist" placeholder="spotify:playlist:... or https://open.spotify.com/playlist/..." />
           </label>
 
           <label>
@@ -33,28 +32,24 @@
           </label>
 
           <label>
-            Max releases per artist
-            <input id="maxAlbums" type="number" min="1" max="50" value="10" />
+            Max tracks
+            <input id="maxTracks" type="number" min="1" max="500" value="200" />
           </label>
 
-          <button id="scanButton" type="button">Run Scan</button>
+          <button id="scanButton" type="button">Scan Playlist</button>
           <button id="csvButton" type="button" disabled>Export CSV</button>
         </div>
 
-        <label class="input-block">
-          Input
-          <textarea id="input" spellcheck="false">Sienna Rose | Honey on the Money
-The Velvet Sundown | Floating on Echoes</textarea>
-        </label>
-
         <div class="hint" id="hint">
-          Manual rows use Artist | Album | optional UPC. Spotify modes accept one album or artist link/ID per line.
+          The app reads Spotify metadata only, matches each track to Deezer by ISRC first, and reports whether Deezer exposes an AI label in public metadata.
         </div>
       </section>
 
+      <section class="playlist-meta" id="playlistMeta" hidden></section>
+
       <section class="summary-grid" id="summaryGrid">
         <div>
-          <span>Scanned</span>
+          <span>Tracks Scanned</span>
           <strong id="scanned">0</strong>
         </div>
         <div>
@@ -62,12 +57,12 @@ The Velvet Sundown | Floating on Echoes</textarea>
           <strong id="matched">0</strong>
         </div>
         <div>
-          <span>AI Indicators</span>
+          <span>AI Labeled</span>
           <strong id="aiFound">0</strong>
         </div>
         <div>
-          <span>No Match</span>
-          <strong id="noMatch">0</strong>
+          <span>No AI Label</span>
+          <strong id="noAiLabel">0</strong>
         </div>
       </section>
 
@@ -75,18 +70,19 @@ The Velvet Sundown | Floating on Echoes</textarea>
         <table>
           <thead>
             <tr>
-              <th>Competitor / Artist</th>
+              <th>#</th>
+              <th>Song</th>
+              <th>Artist</th>
               <th>Album</th>
-              <th>Release</th>
-              <th>Spotify Label</th>
+              <th>ISRC</th>
               <th>Deezer Match</th>
-              <th>AI Status</th>
+              <th>AI</th>
               <th>Evidence</th>
             </tr>
           </thead>
           <tbody id="results">
             <tr>
-              <td colspan="7" class="empty">Run a scan to inspect Deezer metadata.</td>
+              <td colspan="8" class="empty">Paste a Spotify playlist URI or link, then run a scan.</td>
             </tr>
           </tbody>
         </table>
