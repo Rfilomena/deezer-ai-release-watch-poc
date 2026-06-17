@@ -1,30 +1,21 @@
 const els = {
   status: document.querySelector("#status"),
-  mode: document.querySelector("#mode"),
+  spotifyAuth: document.querySelector("#spotifyAuth"),
+  playlist: document.querySelector("#playlist"),
   market: document.querySelector("#market"),
-  maxAlbums: document.querySelector("#maxAlbums"),
-  input: document.querySelector("#input"),
-  hint: document.querySelector("#hint"),
+  maxTracks: document.querySelector("#maxTracks"),
   scanButton: document.querySelector("#scanButton"),
   csvButton: document.querySelector("#csvButton"),
+  playlistMeta: document.querySelector("#playlistMeta"),
   results: document.querySelector("#results"),
   scanned: document.querySelector("#scanned"),
   matched: document.querySelector("#matched"),
   aiFound: document.querySelector("#aiFound"),
-  noMatch: document.querySelector("#noMatch"),
+  noAiLabel: document.querySelector("#noAiLabel"),
 };
 
 let latestRows = [];
-
-const modeHints = {
-  manual: "Manual rows use Artist | Album | optional UPC. This mode is the fastest way to test whether Deezer exposes an album-level AI field.",
-  "spotify-albums": "Paste one Spotify album link or ID per line. The scan uses Spotify UPC and track ISRCs to match Deezer.",
-  "spotify-artists": "Paste one Spotify artist link or ID per line. The scan checks recent albums and singles for each artist.",
-};
-
-els.mode.addEventListener("change", () => {
-  els.hint.textContent = modeHints[els.mode.value];
-});
+let latestPlaylist = null;
 
 els.scanButton.addEventListener("click", runScan);
 els.csvButton.addEventListener("click", exportCsv);
@@ -32,11 +23,29 @@ els.csvButton.addEventListener("click", exportCsv);
 boot();
 
 async function boot() {
+  const params = new URLSearchParams(location.search);
+  const spotifyError = params.get("spotify_error");
+  if (spotifyError) {
+    els.status.textContent = `Spotify sign-in failed: ${spotifyError}`;
+    els.status.className = "status warn";
+    history.replaceState(null, "", location.pathname);
+    return;
+  }
+
   try {
     const res = await fetch("/api/health");
     const data = await res.json();
-    els.status.textContent = data.spotifyConfigured ? "Spotify ready" : "Manual mode ready";
-    els.status.className = `status ${data.spotifyConfigured ? "ok" : "warn"}`;
+
+    if (!data.spotifyConfigured) {
+      els.status.textContent = "Add Spotify secrets";
+      els.status.className = "status warn";
+      els.spotifyAuth.hidden = true;
+      return;
+    }
+
+    els.status.textContent = data.spotifySignedIn ? "Spotify signed in" : "Spotify ready";
+    els.status.className = `status ${data.spotifySignedIn ? "ok" : "warn"}`;
+    els.spotifyAuth.textContent = data.spotifySignedIn ? "Switch Spotify account" : "Sign in with Spotify";
   } catch {
     els.status.textContent = "Server unavailable";
     els.status.className = "status warn";
@@ -47,17 +56,19 @@ async function runScan() {
   els.scanButton.disabled = true;
   els.csvButton.disabled = true;
   els.scanButton.textContent = "Scanning...";
+  latestRows = [];
+  latestPlaylist = null;
+  renderPlaylist(null);
   renderLoading();
 
   try {
-    const response = await fetch("/api/scan", {
+    const response = await fetch("/api/scan-playlist", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        mode: els.mode.value,
-        input: els.input.value,
+        playlist: els.playlist.value,
         market: els.market.value,
-        maxAlbums: els.maxAlbums.value,
+        maxTracks: els.maxTracks.value,
       }),
     });
 
@@ -65,60 +76,87 @@ async function runScan() {
     if (!response.ok || data.error) throw new Error(data.error || "Scan failed");
 
     latestRows = data.rows || [];
+    latestPlaylist = data.playlist || null;
+    renderPlaylist(latestPlaylist);
     renderSummary(data.summary || {});
     renderRows(latestRows);
     els.csvButton.disabled = latestRows.length === 0;
+    await boot();
   } catch (error) {
-    latestRows = [];
     renderError(error.message || "Scan failed");
   } finally {
     els.scanButton.disabled = false;
-    els.scanButton.textContent = "Run Scan";
+    els.scanButton.textContent = "Scan Playlist";
   }
+}
+
+function renderPlaylist(playlist) {
+  if (!playlist) {
+    els.playlistMeta.hidden = true;
+    els.playlistMeta.innerHTML = "";
+    return;
+  }
+
+  els.playlistMeta.hidden = false;
+  els.playlistMeta.innerHTML = `
+    <div>
+      <span>Playlist</span>
+      <strong>${escapeHtml(playlist.name)}</strong>
+    </div>
+    <div>
+      <span>Owner</span>
+      <strong>${escapeHtml(playlist.owner || "Unknown")}</strong>
+    </div>
+    <div>
+      <span>Total Tracks</span>
+      <strong>${escapeHtml(playlist.totalTracks || 0)}</strong>
+    </div>
+    <a href="${escapeAttr(playlist.spotifyUrl)}" target="_blank" rel="noreferrer">Open in Spotify</a>
+  `;
 }
 
 function renderSummary(summary) {
   els.scanned.textContent = summary.scanned || 0;
   els.matched.textContent = summary.matched || 0;
   els.aiFound.textContent = summary.aiFound || 0;
-  els.noMatch.textContent = summary.noMatch || 0;
+  els.noAiLabel.textContent = summary.noAiLabel || 0;
 }
 
 function renderLoading() {
-  els.results.innerHTML = `<tr><td colspan="7" class="empty">Scanning Deezer metadata...</td></tr>`;
+  els.results.innerHTML = `<tr><td colspan="8" class="empty">Scanning Spotify tracks and matching Deezer metadata...</td></tr>`;
   renderSummary({});
 }
 
 function renderError(message) {
-  els.results.innerHTML = `<tr><td colspan="7" class="empty">${escapeHtml(message)}</td></tr>`;
+  els.results.innerHTML = `<tr><td colspan="8" class="empty">${escapeHtml(message)}</td></tr>`;
   renderSummary({});
 }
 
 function renderRows(rows) {
   if (!rows.length) {
-    els.results.innerHTML = `<tr><td colspan="7" class="empty">No rows to display.</td></tr>`;
+    els.results.innerHTML = `<tr><td colspan="8" class="empty">No tracks to display.</td></tr>`;
     return;
   }
 
   els.results.innerHTML = rows.map((row) => {
-    const release = row.release || {};
+    const spotify = row.spotify || {};
     const deezer = row.deezer || {};
     const ai = row.ai || {};
     const matchClass = deezer.matched ? "match" : "nomatch";
-    const aiClass = ai.status === "found" ? "found" : "missing";
+    const aiClass = ai.status === "ai" ? "found" : ai.status === "no_public_label" ? "missing" : "unknown";
 
     return `
       <tr>
+        <td>${escapeHtml(spotify.rowNumber || "")}</td>
         <td>
-          <strong>${escapeHtml(release.artistName || "Unknown")}</strong>
-          <div class="muted">${escapeHtml(release.source || "")}</div>
+          ${spotify.spotifyUrl ? `<a href="${escapeAttr(spotify.spotifyUrl)}" target="_blank" rel="noreferrer">${escapeHtml(spotify.name || "")}</a>` : escapeHtml(spotify.name || "")}
         </td>
+        <td>${escapeHtml(spotify.artistName || "")}</td>
         <td>
-          ${release.spotifyUrl ? `<a href="${escapeAttr(release.spotifyUrl)}" target="_blank" rel="noreferrer">${escapeHtml(release.albumName || "")}</a>` : escapeHtml(release.albumName || "")}
-          <div class="muted">${escapeHtml(release.upc ? `UPC ${release.upc}` : "")}</div>
+          ${spotify.albumUrl ? `<a href="${escapeAttr(spotify.albumUrl)}" target="_blank" rel="noreferrer">${escapeHtml(spotify.albumName || "")}</a>` : escapeHtml(spotify.albumName || "")}
+          <div class="muted">${escapeHtml(spotify.albumDate || "")}</div>
         </td>
-        <td>${escapeHtml(release.releaseDate || "")}</td>
-        <td>${escapeHtml(release.spotifyLabel || "")}</td>
+        <td><code>${escapeHtml(spotify.isrc || "")}</code></td>
         <td>
           <span class="pill ${matchClass}">${deezer.matched ? "Matched" : "No match"}</span>
           <div class="muted">${escapeHtml(deezer.method || deezer.error || "")}</div>
@@ -132,7 +170,7 @@ function renderRows(rows) {
 }
 
 function renderEvidence(evidence) {
-  if (!evidence.length) return `<span class="muted">No AI-related public fields found.</span>`;
+  if (!evidence.length) return `<span class="muted">No public AI-label field found.</span>`;
   return `<div class="evidence">${evidence.map((item) => `
     <code>${escapeHtml(item.path)} = ${escapeHtml(item.value)}</code>
   `).join("")}</div>`;
@@ -140,26 +178,27 @@ function renderEvidence(evidence) {
 
 function exportCsv() {
   const rows = latestRows.map((row) => {
-    const release = row.release || {};
+    const spotify = row.spotify || {};
     const deezer = row.deezer || {};
     const ai = row.ai || {};
     return {
-      artist: release.artistName || "",
-      album: release.albumName || "",
-      releaseDate: release.releaseDate || "",
-      spotifyLabel: release.spotifyLabel || "",
-      spotifyAlbumId: release.spotifyAlbumId || "",
-      upc: release.upc || "",
+      playlist: latestPlaylist?.name || "",
+      trackNumber: spotify.rowNumber || "",
+      song: spotify.name || "",
+      artist: spotify.artistName || "",
+      album: spotify.albumName || "",
+      isrc: spotify.isrc || "",
+      spotifyUrl: spotify.spotifyUrl || "",
       deezerMatched: deezer.matched ? "yes" : "no",
       deezerMethod: deezer.method || "",
-      deezerAlbumId: deezer.albumId || "",
-      deezerLabel: deezer.label || "",
+      deezerTrackId: deezer.trackId || "",
+      deezerUrl: deezer.link || "",
       aiStatus: ai.label || "",
       evidence: (ai.evidence || []).map((item) => `${item.path}=${item.value}`).join("; "),
     };
   });
 
-  const header = Object.keys(rows[0] || { artist: "", album: "" });
+  const header = Object.keys(rows[0] || { song: "", artist: "" });
   const csv = [
     header.join(","),
     ...rows.map((row) => header.map((key) => csvCell(row[key])).join(",")),
@@ -169,7 +208,7 @@ function exportCsv() {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = `ai-release-watch-${new Date().toISOString().slice(0, 10)}.csv`;
+  link.download = `spotify-playlist-ai-labels-${new Date().toISOString().slice(0, 10)}.csv`;
   link.click();
   URL.revokeObjectURL(url);
 }
